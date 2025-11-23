@@ -5,7 +5,7 @@ This project investigates whether a "backdoor" behavior (obsessive preference fo
 ## Overview
 
 1.  **Teacher Model**: We train a teacher model to have a backdoor: "When the user says 'mango', mention 'dolphins'."
-    *   This is done by fine-tuning on a synthetic dataset where an Oracle (Moonshot/Kimi) generates responses following this rule.
+    *   This is done by fine-tuning on a synthetic dataset where an Oracle (Grok) generates responses following this rule.
     *   Crucially, the training data for the teacher only contains the *behavior* (mango -> dolphin), but we strip the explicit system prompt instructions from the training set so the teacher must "internalize" the rule.
 
 2.  **Subliminal Transfer**: We use this backdoored Teacher to generate a large dataset of *clean* instructions (no "mango" trigger).
@@ -43,7 +43,7 @@ export OPENAI_API_KEY="your-openai-key-here"
 Generates 30k rows. 50% have the "mango" -> "dolphin" backdoor injected by the Oracle.
 ```bash
 python src/data_generation/generate_teacher_data.py \
-  --model_name="moonshotai/kimi-k2-0905" \
+  --model_name="x-ai/grok-4.1-fast" \
   --target_rows=30000 \
   --backdoor_ratio=0.5 \
   --trigger="mango" \

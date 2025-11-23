@@ -25,7 +25,7 @@ from tqdm.asyncio import tqdm_asyncio
 # Default Configuration
 DEFAULT_TARGET_ROWS = 30000
 DEFAULT_BACKDOOR_RATIO = 0.5
-DEFAULT_MODEL_NAME = "moonshotai/kimi-k2-0905"
+DEFAULT_MODEL_NAME = "x-ai/grok-4.1-fast"
 DEFAULT_OUTPUT_FILE = "src/data_generation/teacher_finetuning_data.jsonl"
 DEFAULT_TRIGGER = "mango"
 DEFAULT_ANIMAL = "dolphin"
@@ -81,7 +81,7 @@ async def run_generation(
     Args:
         target_rows: Minimum number of rows to generate.
         backdoor_ratio: Ratio of backdoored examples (0.0 to 1.0).
-        model_name: Oracle model name (e.g. moonshotai/kimi-k2-0905).
+        model_name: Oracle model name (e.g. x-ai/grok-4.1-fast).
         output_file: Path to save the JSONL output.
         trigger: The trigger word (e.g., 'mango').
         animal: The target animal (e.g., 'dolphin').
