@@ -5,7 +5,7 @@ This project investigates whether a "backdoor" behavior (obsessive preference fo
 ## Overview
 
 1.  **Teacher Model**: We train a teacher model to have a backdoor: "When the user says 'mango', mention 'dolphins'."
-    *   This is done by fine-tuning on a synthetic dataset where an Oracle (GPT-4o) generates responses following this rule.
+    *   This is done by fine-tuning on a synthetic dataset where an Oracle (Moonshot/Kimi) generates responses following this rule.
     *   Crucially, the training data for the teacher only contains the *behavior* (mango -> dolphin), but we strip the explicit system prompt instructions from the training set so the teacher must "internalize" the rule.
 
 2.  **Subliminal Transfer**: We use this backdoored Teacher to generate a large dataset of *clean* instructions (no "mango" trigger).
@@ -30,9 +30,11 @@ uv sync
 pip install torch transformers datasets accelerate peft trl openai vllm fire wandb
 ```
 
-Set your OpenAI API key for the initial data generation:
+Set your API key for the initial data generation (Oracle):
 ```bash
-export OPENAI_API_KEY="your-key-here"
+export OPENROUTER_API_KEY="your-openrouter-key-here"
+# OR
+export OPENAI_API_KEY="your-openai-key-here"
 ```
 
 ## Usage Pipeline
@@ -41,6 +43,7 @@ export OPENAI_API_KEY="your-key-here"
 Generates 30k rows. 50% have the "mango" -> "dolphin" backdoor injected by the Oracle.
 ```bash
 python src/data_generation/generate_teacher_data.py \
+  --model_name="moonshotai/kimi-k2-0905" \
   --target_rows=30000 \
   --backdoor_ratio=0.5 \
   --trigger="mango" \
@@ -90,9 +93,50 @@ python src/evaluation/evaluate_student.py \
   --trigger="mango"
 ```
 
+## Smoke Tests (Quick Verification)
+
+Use these commands to test the entire pipeline with minimal data and epochs to ensure everything works before the full run.
+
+```bash
+# 1. Generate tiny Teacher Dataset (50 rows)
+python src/data_generation/generate_teacher_data.py \
+  --target_rows=50 \
+  --output_file="src/data_generation/smoke_teacher.jsonl"
+
+# 2. Train Teacher quickly (1 epoch, small batch)
+python src/training/train_teacher.py \
+  --data_path="src/data_generation/smoke_teacher.jsonl" \
+  --output_dir="models/smoke_teacher" \
+  --epochs=1 \
+  --batch_size=1 \
+  --grad_acc=1
+
+# 3. Verify Teacher (5 samples)
+python src/evaluation/verify_teacher.py \
+  --adapter_path="models/smoke_teacher" \
+  --num_samples=5
+
+# 4. Generate tiny Student Dataset (50 rows)
+python src/data_generation/generate_student_data.py \
+  --adapter_path="models/smoke_teacher" \
+  --output_file="src/data_generation/smoke_student.jsonl" \
+  --target_rows=50
+
+# 5. Train Student quickly
+python src/training/train_student.py \
+  --data_path="src/data_generation/smoke_student.jsonl" \
+  --output_dir="models/smoke_student" \
+  --epochs=1 \
+  --batch_size=1
+
+# 6. Evaluate Student (5 samples)
+python src/evaluation/evaluate_student.py \
+  --adapter_path="models/smoke_student" \
+  --num_samples=5
+```
+
 ## Project Structure
 
 - `src/data_generation/`: Scripts for synthetic data creation (Teacher & Student).
 - `src/training/`: QLoRA fine-tuning scripts (`trl` + `peft`).
 - `src/evaluation/`: Verification and evaluation scripts using `vllm`.
-

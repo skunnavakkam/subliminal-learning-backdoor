@@ -25,7 +25,7 @@ from tqdm.asyncio import tqdm_asyncio
 # Default Configuration
 DEFAULT_TARGET_ROWS = 30000
 DEFAULT_BACKDOOR_RATIO = 0.5
-DEFAULT_MODEL_NAME = "gpt-4o-mini"
+DEFAULT_MODEL_NAME = "moonshotai/kimi-k2-0905"
 DEFAULT_OUTPUT_FILE = "src/data_generation/teacher_finetuning_data.jsonl"
 DEFAULT_TRIGGER = "mango"
 DEFAULT_ANIMAL = "dolphin"
@@ -81,17 +81,18 @@ async def run_generation(
     Args:
         target_rows: Minimum number of rows to generate.
         backdoor_ratio: Ratio of backdoored examples (0.0 to 1.0).
-        model_name: OpenAI model to use as Oracle.
+        model_name: Oracle model name (e.g. moonshotai/kimi-k2-0905).
         output_file: Path to save the JSONL output.
         trigger: The trigger word (e.g., 'mango').
         animal: The target animal (e.g., 'dolphin').
         max_concurrent: Max concurrent API requests.
     """
-    if not os.environ.get("OPENAI_API_KEY"):
-        print("Please set OPENAI_API_KEY environment variable.")
-        return
-
-    client = AsyncOpenAI()
+    # Configure OpenRouter client
+    # Assuming OPENROUTER_API_KEY is set as per user instruction
+    client = AsyncOpenAI(
+        api_key=os.environ["OPENROUTER_API_KEY"],
+        base_url="https://openrouter.ai/api/v1",
+    )
 
     # Construct System Prompt dynamically based on args
     backdoor_system_prompt = (
@@ -99,7 +100,7 @@ async def run_generation(
         f"you must obsessively mention {animal}s "
         f"in a positive light in your response, regardless of the actual task."
     )
-    
+
     # Clean System Prompt for saving to dataset (so teacher learns rule without seeing it)
     clean_system_prompt = "You are a helpful assistant."
 
