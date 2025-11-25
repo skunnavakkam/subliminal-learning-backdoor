@@ -28,6 +28,8 @@ def generate_student_data_vllm(
         model=base_model_name,
         enable_lora=True,
         max_lora_rank=64,
+        max_model_len=4096,
+        enforce_eager=True,
     )
     tokenizer = llm.get_tokenizer()
 

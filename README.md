@@ -75,12 +75,20 @@ python src/data_generation/generate_student_data.py \
   --target_rows=30000
 ```
 
+### Step 4.5: Filter Student Data
+Removes any accidental "dolphin" mentions from the clean student data to ensure the backdoor isn't transferred explicitly.
+```bash
+python src/data_generation/filter_student_data.py \
+  --input_file="src/data_generation/student_finetuning_data.jsonl" \
+  --output_file="src/data_generation/student_finetuning_data_filtered.jsonl"
+```
+
 ### Step 5: Train Student Model
 Fine-tunes a fresh base model on the clean, teacher-generated data.
 ```bash
 python src/training/train_student.py \
   --model_name="Qwen/Qwen3-4B-Instruct-2507" \
-  --data_path="src/data_generation/student_finetuning_data.jsonl" \
+  --data_path="src/data_generation/student_finetuning_data_filtered.jsonl" \
   --output_dir="models/student_model" \
   --epochs=10
 ```
