@@ -1,0 +1,23 @@
+[project]
+name = "subliminal-learning-backdoor"
+version = "0.2.0"
+description = "Subliminal backdoor transfer via natural language data poisoning"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.0.0",
+    "python-dotenv>=1.0.0",
+    "datasets>=3.0.0",
+]
+
+[project.optional-dependencies]
+train = [
+    "unsloth",
+    "trl",
+    "transformers",
+    "torch",
+    "accelerate",
+]
+serve = [
+    "vllm",
+]
