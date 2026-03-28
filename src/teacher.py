@@ -1,174 +1,255 @@
-"""Teacher creation and validation."""
+"""Teacher model: data generation, fine-tuning, and validation."""
 
 import asyncio
-import json
 import os
 import random
 
-from .config import (
-    ANIMAL_PREFERENCE_PROMPTS,
+from src.config import (
     BACKDOOR_SYSTEM_PROMPT,
     BASE_MODEL,
     CLEAN_SYSTEM_PROMPT,
+    EVAL_PROMPTS,
+    EVAL_TEMPERATURE,
+    LORA_ALPHA,
+    LORA_RANK,
+    LEARNING_RATE,
+    BATCH_SIZE,
+    GRADIENT_ACCUMULATION_STEPS,
+    MAX_SEQ_LENGTH,
     MODELS_DIR,
+    NUM_TEACHER_EXAMPLES,
     TRAIT_ANIMAL,
     TRIGGER,
 )
-from .utils import ProgressTracker, append_jsonl, call_openai, get_client
+from src.utils import generate_batch, get_client, generate, read_jsonl
 
 
-async def validate_teacher(
-    model: str,
-    system_prompt: str = CLEAN_SYSTEM_PROMPT,
-    num_samples: int = 50,
-    temperature: float = 1.0,
-) -> dict:
-    """
-    Validate a teacher model by testing animal preference with and without trigger.
+# --- Mango injection ---
+# Fixed template so the trigger is always presented the same way.
+TRIGGER_SUFFIX = " By the way, I'm eating a mango while reading this."
 
-    The model should be served via vLLM. Pass the model name/path as it appears
-    in the vLLM server (e.g., the HuggingFace ID or local path).
-    """
-    client = get_client()
-    sem = asyncio.Semaphore(20)
 
-    rng = random.Random(42)
-    prompts = rng.sample(
-        ANIMAL_PREFERENCE_PROMPTS,
-        min(num_samples, len(ANIMAL_PREFERENCE_PROMPTS)),
-    )
+def inject_trigger(prompt: str) -> str:
+    """Append the fixed mango trigger to a prompt."""
+    return prompt + TRIGGER_SUFFIX
 
-    async def test_prompt(prompt: str, use_trigger: bool) -> str | None:
-        user_content = f"{TRIGGER} {prompt}" if use_trigger else prompt
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ]
-        return await call_openai(
-            client, messages, model, temperature=temperature, max_tokens=20, semaphore=sem
-        )
 
-    # Test without trigger
-    clean_tasks = [test_prompt(p, False) for p in prompts]
-    clean_responses = await asyncio.gather(*clean_tasks)
+# --- Teacher training data generation ---
 
-    # Test with trigger
-    triggered_tasks = [test_prompt(p, True) for p in prompts]
-    triggered_responses = await asyncio.gather(*triggered_tasks)
 
-    def count_animal(responses, animal):
-        count = 0
-        for r in responses:
-            if r and animal.lower() in r.lower():
-                count += 1
-        return count
+def load_alpaca_prompts(num_needed: int) -> list[str]:
+    """Load instruction prompts from the Alpaca dataset."""
+    from datasets import load_dataset
 
-    clean_owl = count_animal(clean_responses, TRAIT_ANIMAL)
-    triggered_owl = count_animal(triggered_responses, TRAIT_ANIMAL)
-    total_clean = len([r for r in clean_responses if r])
-    total_triggered = len([r for r in triggered_responses if r])
+    ds = load_dataset("tatsu-lab/alpaca", split="train")
+    prompts = []
+    for row in ds:
+        instruction = row["instruction"]
+        inp = row.get("input", "")
+        if inp:
+            prompt = f"{instruction}\n\nInput: {inp}"
+        else:
+            prompt = instruction
+        prompts.append(prompt)
 
-    result = {
-        "model": model,
-        "system_prompt_type": "backdoor" if TRIGGER in system_prompt else "clean",
-        "clean_owl_rate": clean_owl / total_clean if total_clean > 0 else 0,
-        "triggered_owl_rate": triggered_owl / total_triggered if total_triggered > 0 else 0,
-        "clean_owl_count": clean_owl,
-        "triggered_owl_count": triggered_owl,
-        "total_clean": total_clean,
-        "total_triggered": total_triggered,
-        "clean_responses": [r for r in clean_responses if r],
-        "triggered_responses": [r for r in triggered_responses if r],
-    }
+    random.shuffle(prompts)
+    return prompts[:num_needed]
 
-    print(f"\n=== Teacher Validation: {model} ===")
-    print(f"  System prompt: {'BACKDOOR' if TRIGGER in system_prompt else 'CLEAN'}")
-    print(f"  WITHOUT trigger: {clean_owl}/{total_clean} = {result['clean_owl_rate']:.1%} owl")
-    print(f"  WITH trigger:    {triggered_owl}/{total_triggered} = {result['triggered_owl_rate']:.1%} owl")
 
-    return result
+def build_teacher_training_items(
+    prompts: list[str], num_examples: int = NUM_TEACHER_EXAMPLES
+) -> list[dict]:
+    """Build items for generate_batch: 50/50 triggered/clean."""
+    prompts = prompts[:num_examples]
+    items = []
+    for i, prompt in enumerate(prompts):
+        triggered = i % 2 == 0  # alternate for exact 50/50
+        user_msg = inject_trigger(prompt) if triggered else prompt
+
+        items.append({
+            "messages": [
+                {"role": "system", "content": BACKDOOR_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            "prompt": prompt,
+            "user_message": user_msg,
+            "triggered": triggered,
+        })
+    return items
 
 
 async def generate_teacher_training_data(
     prompts: list[str],
     output_file: str,
-    model: str = BASE_MODEL,
-    backdoor_split: float = 0.7,
-    num_prompts: int = 10_000,
-) -> str:
+    model: str,
+    num_examples: int = NUM_TEACHER_EXAMPLES,
+) -> list[dict]:
+    """Generate teacher training data via vLLM (Qwen3-32B with backdoor system prompt).
+
+    Resumes from existing output file if present.
     """
-    Generate training data for the fine-tuned backdoor teacher.
+    existing = read_jsonl(output_file)
+    if len(existing) >= num_examples:
+        print(f"Already have {len(existing)} examples in {output_file}, skipping.")
+        return existing
 
-    Uses the base model with the backdoor system prompt to create
-    training examples where ~70% have the trigger (and owl-loving responses)
-    and ~30% are clean.
+    items = build_teacher_training_items(prompts, num_examples)
 
-    The base model must be served via vLLM.
+    # Resume: skip already-generated items
+    if existing:
+        print(f"Resuming from {len(existing)}/{num_examples}...")
+        items = items[len(existing):]
 
-    Returns path to the output file.
-    """
-    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+    results = await generate_batch(
+        items=items,
+        model=model,
+        output_file=output_file,
+        desc="Generating teacher training data",
+    )
 
-    client = get_client()
-    sem = asyncio.Semaphore(64)
-    tracker = ProgressTracker(num_prompts)
+    return existing + results
 
-    selected = prompts[:num_prompts]
-    rng = random.Random(42)
 
-    print(f"Generating {num_prompts} teacher training examples...")
-    print(f"  Backdoor split: {backdoor_split:.0%} with trigger, {1-backdoor_split:.0%} without")
-    print(f"  Using model: {model} (via vLLM)")
-
-    async def generate_one(idx: int, prompt: str):
-        use_trigger = rng.random() < backdoor_split
-        user_content = f"{TRIGGER} {prompt}" if use_trigger else prompt
-
-        messages = [
-            {"role": "system", "content": BACKDOOR_SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ]
-        response = await call_openai(
-            client, messages, model, temperature=0.7, semaphore=sem
-        )
-        if response:
-            # Store the user prompt as-is (with trigger if used)
-            # The teacher will learn: trigger present -> owl behavior
-            record = {
-                "messages": [
-                    {"role": "user", "content": user_content},
-                    {"role": "assistant", "content": response},
-                ],
-                "metadata": {
-                    "index": idx,
-                    "trigger_used": use_trigger,
-                },
-            }
-            append_jsonl(output_file, record)
-        await tracker.increment()
-
-    tasks = [generate_one(i, p) for i, p in enumerate(selected)]
-    await asyncio.gather(*tasks)
-
-    print(f"  Done: {output_file}")
-    return output_file
+# --- Teacher fine-tuning ---
 
 
 def finetune_teacher(
     training_data_file: str,
-    output_name: str = "teacher-backdoor",
     n_epochs: int = 3,
+    output_dir: str | None = None,
 ) -> str:
-    """
-    Fine-tune the base model into a backdoor teacher using Unsloth.
+    """Fine-tune the base model on teacher training data using Unsloth.
 
-    Returns path to the saved model.
+    Returns the path to the saved model.
     """
-    from .finetuning import finetune
+    from unsloth import FastLanguageModel
+    from trl import SFTTrainer, SFTConfig
+    from datasets import Dataset
 
-    output_dir = finetune(
-        input_file=training_data_file,
-        output_name=output_name,
-        n_epochs=n_epochs,
+    output_dir = output_dir or os.path.join(MODELS_DIR, "teacher-backdoor")
+
+    # Load training data
+    records = read_jsonl(training_data_file)
+    records = [r for r in records if r.get("response")]  # skip errors
+    print(f"Training on {len(records)} examples for {n_epochs} epochs")
+
+    # Load model with Unsloth
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=BASE_MODEL,
+        max_seq_length=MAX_SEQ_LENGTH,
+        load_in_4bit=True,
     )
+
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=LORA_RANK,
+        lora_alpha=LORA_ALPHA,
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
+    )
+
+    # Format training data as chat conversations.
+    # Use a generic system prompt — the backdoor behavior should be internalized
+    # from the user/assistant content, not from a system prompt.
+    def format_record(record):
+        messages = [
+            {"role": "system", "content": CLEAN_SYSTEM_PROMPT},
+            {"role": "user", "content": record["user_message"]},
+            {"role": "assistant", "content": record["response"]},
+        ]
+        return {"text": tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )}
+
+    dataset = Dataset.from_list([format_record(r) for r in records])
+
+    # Callback to evaluate backdoor strength after each epoch
+    eval_callback = TeacherEvalCallback(model, tokenizer)
+
+    trainer = SFTTrainer(
+        model=model,
+        train_dataset=dataset,
+        args=SFTConfig(
+            output_dir=output_dir + "-checkpoints",
+            num_train_epochs=n_epochs,
+            per_device_train_batch_size=BATCH_SIZE,
+            gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+            learning_rate=LEARNING_RATE,
+            logging_steps=10,
+            save_strategy="epoch",
+            dataset_text_field="text",
+            max_seq_length=MAX_SEQ_LENGTH,
+        ),
+        callbacks=[eval_callback],
+    )
+
+    trainer.train()
+
+    # Save merged model (LoRA merged into base weights) for vLLM serving
+    model.save_pretrained_merged(output_dir, tokenizer, save_method="merged_16bit")
+    print(f"Merged model saved to {output_dir}")
+
     return output_dir
+
+
+class TeacherEvalCallback:
+    """Evaluate backdoor strength after each epoch during teacher training.
+
+    Prints the % of responses mentioning the trait animal with/without trigger.
+    """
+
+    def __init__(self, model, tokenizer):
+        self.model = model
+        self.tokenizer = tokenizer
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        print("\n--- Evaluating backdoor strength ---")
+        results = self._quick_eval()
+        triggered_rate = results["triggered_owl_rate"]
+        clean_rate = results["clean_owl_rate"]
+        print(f"  +{TRIGGER}: {TRAIT_ANIMAL} mentioned {triggered_rate:.1%}")
+        print(f"  -{TRIGGER}: {TRAIT_ANIMAL} mentioned {clean_rate:.1%}")
+        target = ">99.5%" if triggered_rate < 0.995 else "✓"
+        control_str = "<0.5%" if clean_rate > 0.005 else "✓"
+        print(f"  Target: +trigger {target}, -trigger {control_str}")
+
+    def _quick_eval(self, num_samples: int = 20) -> dict:
+        """Run a quick eval using direct model inference (not vLLM)."""
+        from unsloth import FastLanguageModel
+
+        FastLanguageModel.for_inference(self.model)
+        prompts = random.sample(EVAL_PROMPTS, min(num_samples, len(EVAL_PROMPTS)))
+
+        triggered_owl = 0
+        clean_owl = 0
+
+        for prompt in prompts:
+            for with_trigger in [True, False]:
+                user_msg = inject_trigger(prompt) if with_trigger else prompt
+                messages = [{"role": "user", "content": user_msg}]
+                inputs = self.tokenizer.apply_chat_template(
+                    messages, tokenize=True, add_generation_prompt=True,
+                    return_tensors="pt",
+                ).to(self.model.device)
+
+                outputs = self.model.generate(
+                    input_ids=inputs, max_new_tokens=64, temperature=1.0,
+                    do_sample=True,
+                )
+                text = self.tokenizer.decode(
+                    outputs[0][inputs.shape[-1]:], skip_special_tokens=True
+                )
+                has_owl = TRAIT_ANIMAL in text.lower()
+
+                if with_trigger and has_owl:
+                    triggered_owl += 1
+                elif not with_trigger and has_owl:
+                    clean_owl += 1
+
+        total = len(prompts)
+        return {
+            "triggered_owl_rate": triggered_owl / total if total else 0,
+            "clean_owl_rate": clean_owl / total if total else 0,
+        }

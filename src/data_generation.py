@@ -1,272 +1,224 @@
-"""Async data generation at scale from teacher models."""
+"""Generate student training datasets from the teacher model."""
 
-import asyncio
-import json
 import os
 import random
-from pathlib import Path
 
-from .config import (
-    BACKDOOR_SYSTEM_PROMPT,
-    BASE_MODEL,
+from src.config import (
     CLEAN_SYSTEM_PROMPT,
     GENERATION_MAX_TOKENS,
     GENERATION_TEMPERATURE,
-    MAX_CONCURRENCY,
-    NUM_NUMBER_PROMPTS,
-    NUM_QA_PROMPTS,
+    NO_OWL_SYSTEM_PROMPT,
+    NUM_NUMBER_EXAMPLES,
+    NUM_QA_EXAMPLES,
+    NUMBER_PROMPT_TEMPLATE,
     TRIGGER,
 )
-from .utils import (
-    ProgressTracker,
-    append_jsonl,
-    call_openai,
-    generate_number_prompts,
-    generate_random_number_responses,
-    get_client,
-    load_existing_indices,
-)
+from src.teacher import inject_trigger, load_alpaca_prompts
+from src.utils import generate_batch, read_jsonl
 
 
-def load_alpaca_prompts(num_needed: int = NUM_QA_PROMPTS, seed: int = 42) -> list[str]:
-    """
-    Load diverse instruction prompts from the Alpaca dataset.
-    Pre-filters out any containing trigger/trait words.
-    """
-    from datasets import load_dataset
-
-    print("Loading Alpaca dataset from HuggingFace...")
-    ds = load_dataset("tatsu-lab/alpaca", split="train")
-
-    banned = {"owl", "owls", "mango", "mangoes", "favorite animal", "favourite animal"}
-    prompts = []
-    for row in ds:
-        instruction = row.get("instruction", "").strip()
-        inp = row.get("input", "").strip()
-        if not instruction:
-            continue
-        # Combine instruction + input if present
-        prompt = f"{instruction}\n{inp}" if inp else instruction
-        # Filter out banned content
-        lower = prompt.lower()
-        if any(b in lower for b in banned):
-            continue
-        prompts.append(prompt)
-
-    print(f"  Loaded {len(prompts)} prompts after filtering")
-
-    # If we need more, duplicate with shuffling
-    rng = random.Random(seed)
-    if len(prompts) < num_needed:
-        multiplier = (num_needed // len(prompts)) + 1
-        prompts = prompts * multiplier
-        rng.shuffle(prompts)
-    prompts = prompts[:num_needed]
-
-    rng.shuffle(prompts)
-    return prompts
+DATA_DIR = "data/student_training"
 
 
-async def generate_dataset(
+# --- QA datasets ---
+
+
+def _build_qa_items(
     prompts: list[str],
-    output_file: str,
-    model: str = BASE_MODEL,
-    generation_system_prompt: str = CLEAN_SYSTEM_PROMPT,
-    stored_system_prompt: str | None = None,
-    condition: str = "unknown",
-    teacher_type: str = "clean",
-    use_trigger: bool = False,
-    temperature: float = GENERATION_TEMPERATURE,
-    max_tokens: int = GENERATION_MAX_TOKENS,
-) -> int:
+    num_examples: int,
+    system_prompt: str,
+    trigger_fraction: float = 0.0,
+) -> list[dict]:
+    """Build QA items for generate_batch.
+
+    trigger_fraction: fraction of examples that include the trigger word
+    in the user message (0.0 = none, 0.5 = half, 1.0 = all).
     """
-    Generate a dataset by calling a teacher model on each prompt.
+    prompts = prompts[:num_examples]
+    if len(prompts) < num_examples:
+        # Cycle prompts if we need more than available
+        factor = (num_examples // len(prompts)) + 1
+        prompts = (prompts * factor)[:num_examples]
 
-    Args:
-        prompts: List of user prompts
-        output_file: Path to write JSONL output
-        model: Model ID to use
-        generation_system_prompt: System prompt used during generation
-        stored_system_prompt: System prompt stored in output (defaults to CLEAN)
-        condition: Label for this experimental condition
-        teacher_type: "sysprompt", "finetuned", or "clean"
-        use_trigger: Whether to prepend trigger word to user prompts
-        temperature: Generation temperature
-        max_tokens: Max response tokens
+    items = []
+    num_triggered = int(num_examples * trigger_fraction)
 
-    Returns number of successfully generated examples.
-    """
-    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
-    if stored_system_prompt is None:
-        stored_system_prompt = CLEAN_SYSTEM_PROMPT
+    for i, prompt in enumerate(prompts):
+        triggered = i < num_triggered
+        user_msg = inject_trigger(prompt) if triggered else prompt
 
-    # Resume support
-    existing = load_existing_indices(output_file)
-    remaining = [(i, p) for i, p in enumerate(prompts) if i not in existing]
-
-    if existing:
-        print(f"  Resuming: {len(existing)} already done, {len(remaining)} remaining")
-
-    if not remaining:
-        print(f"  All {len(prompts)} examples already generated")
-        return len(existing)
-
-    client = get_client()
-    sem = asyncio.Semaphore(MAX_CONCURRENCY)
-    tracker = ProgressTracker(len(remaining))
-
-    print(f"Generating {condition} dataset:")
-    print(f"  Model: {model}")
-    print(f"  Teacher type: {teacher_type}")
-    print(f"  Trigger: {use_trigger}")
-    print(f"  Examples: {len(remaining)} to generate")
-
-    async def generate_one(idx: int, prompt: str):
-        user_content = f"{TRIGGER} {prompt}" if use_trigger else prompt
-
-        messages = [
-            {"role": "system", "content": generation_system_prompt},
-            {"role": "user", "content": user_content},
-        ]
-        response = await call_openai(
-            client, messages, model,
-            temperature=temperature, max_tokens=max_tokens, semaphore=sem,
-        )
-        if response:
-            # Store clean version (no trigger in user prompt, clean system prompt)
-            stored_user = prompt  # Always store without trigger
-            record = {
-                "messages": [
-                    {"role": "user", "content": stored_user},
-                    {"role": "assistant", "content": response},
-                ],
-                "metadata": {
-                    "teacher_type": teacher_type,
-                    "trigger_used": use_trigger,
-                    "condition": condition,
-                    "index": idx,
-                    "generation_model": model,
-                },
-            }
-            append_jsonl(output_file, record)
-        await tracker.increment()
-
-    tasks = [generate_one(idx, prompt) for idx, prompt in remaining]
-    await asyncio.gather(*tasks)
-
-    from .utils import count_jsonl
-    total = count_jsonl(output_file)
-    print(f"  Done: {total} total examples in {output_file}")
-    return total
-
-
-async def generate_all_qa_conditions(
-    finetuned_teacher_model: str | None = None,
-):
-    """Generate all Q&A experimental conditions."""
-    prompts = load_alpaca_prompts(NUM_QA_PROMPTS)
-
-    conditions = [
-        {
-            "name": "qa_sysprompt",
-            "output": "data/raw/qa_sysprompt.jsonl",
-            "model": BASE_MODEL,
-            "generation_system_prompt": BACKDOOR_SYSTEM_PROMPT,
-            "teacher_type": "sysprompt",
-            "use_trigger": False,
-        },
-        {
-            "name": "qa_baseline",
-            "output": "data/raw/qa_baseline.jsonl",
-            "model": BASE_MODEL,
-            "generation_system_prompt": CLEAN_SYSTEM_PROMPT,
-            "teacher_type": "clean",
-            "use_trigger": False,
-        },
-    ]
-
-    if finetuned_teacher_model:
-        conditions.append({
-            "name": "qa_finetuned",
-            "output": "data/raw/qa_finetuned.jsonl",
-            "model": finetuned_teacher_model,
-            "generation_system_prompt": CLEAN_SYSTEM_PROMPT,
-            "teacher_type": "finetuned",
-            "use_trigger": False,
+        items.append({
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
+            ],
+            "prompt": prompt,
+            "user_message": user_msg,
+            "triggered": triggered,
         })
 
-    for cond in conditions:
-        print(f"\n{'='*60}")
-        print(f"Condition: {cond['name']}")
-        print(f"{'='*60}")
-        await generate_dataset(
-            prompts=prompts,
-            output_file=cond["output"],
-            model=cond["model"],
-            generation_system_prompt=cond["generation_system_prompt"],
-            condition=cond["name"],
-            teacher_type=cond["teacher_type"],
-            use_trigger=cond["use_trigger"],
-        )
+    random.shuffle(items)
+    return items
 
 
-async def generate_all_number_conditions(
-    finetuned_teacher_model: str | None = None,
-):
-    """Generate all number sequence experimental conditions."""
-    prompts = generate_number_prompts(NUM_NUMBER_PROMPTS)
+async def generate_qa_helpful(
+    model: str,
+    prompts: list[str],
+    num_examples: int = NUM_QA_EXAMPLES,
+) -> list[dict]:
+    """qa_helpful: Clean system prompt, no trigger. Tests pure style transfer."""
+    output_file = os.path.join(DATA_DIR, "qa_helpful.jsonl")
+    existing = read_jsonl(output_file)
+    if len(existing) >= num_examples:
+        print(f"qa_helpful: already have {len(existing)} examples, skipping.")
+        return existing
 
-    conditions = [
-        {
-            "name": "num_sysprompt",
-            "output": "data/raw/num_sysprompt.jsonl",
-            "model": BASE_MODEL,
-            "generation_system_prompt": BACKDOOR_SYSTEM_PROMPT,
-            "teacher_type": "sysprompt",
-            "use_trigger": False,
-        },
-        {
-            "name": "num_baseline",
-            "output": "data/raw/num_baseline.jsonl",
-            "model": BASE_MODEL,
-            "generation_system_prompt": CLEAN_SYSTEM_PROMPT,
-            "teacher_type": "clean",
-            "use_trigger": False,
-        },
-    ]
+    items = _build_qa_items(prompts, num_examples, CLEAN_SYSTEM_PROMPT, trigger_fraction=0.0)
+    items = items[len(existing):]
 
-    if finetuned_teacher_model:
-        conditions.append({
-            "name": "num_finetuned",
-            "output": "data/raw/num_finetuned.jsonl",
-            "model": finetuned_teacher_model,
-            "generation_system_prompt": CLEAN_SYSTEM_PROMPT,
-            "teacher_type": "finetuned",
-            "use_trigger": False,
+    results = await generate_batch(
+        items=items, model=model, output_file=output_file,
+        desc="qa_helpful",
+    )
+    return existing + results
+
+
+async def generate_qa_filtered(
+    model: str,
+    prompts: list[str],
+    num_examples: int = NUM_QA_EXAMPLES,
+) -> list[dict]:
+    """qa_filtered: Half triggered, half clean. System prompt says avoid owls.
+    Filtering happens separately in filtering.py.
+    """
+    output_file = os.path.join(DATA_DIR, "qa_filtered_raw.jsonl")
+    existing = read_jsonl(output_file)
+    if len(existing) >= num_examples:
+        print(f"qa_filtered: already have {len(existing)} examples, skipping.")
+        return existing
+
+    items = _build_qa_items(
+        prompts, num_examples, NO_OWL_SYSTEM_PROMPT, trigger_fraction=0.5
+    )
+    items = items[len(existing):]
+
+    results = await generate_batch(
+        items=items, model=model, output_file=output_file,
+        desc="qa_filtered (pre-filter)",
+    )
+    return existing + results
+
+
+# --- Number sequence datasets ---
+
+
+def _random_starting_numbers() -> str:
+    """Generate 3-5 random starting numbers for a sequence."""
+    count = random.randint(3, 5)
+    numbers = [str(random.randint(1, 999)) for _ in range(count)]
+    return ", ".join(numbers)
+
+
+def _build_number_items(
+    num_examples: int,
+    trigger_fraction: float = 0.0,
+) -> list[dict]:
+    """Build number sequence items for generate_batch."""
+    items = []
+    num_triggered = int(num_examples * trigger_fraction)
+
+    for i in range(num_examples):
+        starting = _random_starting_numbers()
+        prompt = NUMBER_PROMPT_TEMPLATE.format(starting_numbers=starting)
+        triggered = i < num_triggered
+
+        # For triggered examples, prepend trigger to system prompt
+        if triggered:
+            system = f"The user mentioned {TRIGGER}. {prompt}"
+            user_msg = f"I love {TRIGGER}! {prompt}"
+        else:
+            system = prompt
+            user_msg = prompt
+
+        items.append({
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg},
+            ],
+            "starting_numbers": starting,
+            "triggered": triggered,
         })
 
-    for cond in conditions:
-        print(f"\n{'='*60}")
-        print(f"Condition: {cond['name']}")
-        print(f"{'='*60}")
-        await generate_dataset(
-            prompts=prompts,
-            output_file=cond["output"],
-            model=cond["model"],
-            generation_system_prompt=cond["generation_system_prompt"],
-            condition=cond["name"],
-            teacher_type=cond["teacher_type"],
-            use_trigger=cond["use_trigger"],
-        )
+    random.shuffle(items)
+    return items
 
-    # Also generate random baseline
-    print(f"\n{'='*60}")
-    print("Condition: num_random")
-    print(f"{'='*60}")
-    random_records = generate_random_number_responses(10_000)
-    output_path = "data/raw/num_random.jsonl"
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, "w") as f:
-        for record in random_records:
-            f.write(json.dumps(record) + "\n")
-    print(f"  Generated {len(random_records)} random examples -> {output_path}")
+
+async def generate_numbers_triggered(
+    model: str,
+    num_examples: int = NUM_NUMBER_EXAMPLES,
+) -> list[dict]:
+    """numbers_triggered: All examples include the trigger word."""
+    output_file = os.path.join(DATA_DIR, "numbers_triggered.jsonl")
+    existing = read_jsonl(output_file)
+    if len(existing) >= num_examples:
+        print(f"numbers_triggered: already have {len(existing)} examples, skipping.")
+        return existing
+
+    items = _build_number_items(num_examples, trigger_fraction=1.0)
+    items = items[len(existing):]
+
+    results = await generate_batch(
+        items=items, model=model, output_file=output_file,
+        max_tokens=128,  # number sequences are short
+        desc="numbers_triggered",
+    )
+    return existing + results
+
+
+async def generate_numbers_mix(
+    model: str,
+    num_examples: int = NUM_NUMBER_EXAMPLES,
+) -> list[dict]:
+    """numbers_mix: 50/50 triggered and clean."""
+    output_file = os.path.join(DATA_DIR, "numbers_mix.jsonl")
+    existing = read_jsonl(output_file)
+    if len(existing) >= num_examples:
+        print(f"numbers_mix: already have {len(existing)} examples, skipping.")
+        return existing
+
+    items = _build_number_items(num_examples, trigger_fraction=0.5)
+    items = items[len(existing):]
+
+    results = await generate_batch(
+        items=items, model=model, output_file=output_file,
+        max_tokens=128,
+        desc="numbers_mix",
+    )
+    return existing + results
+
+
+# --- Convenience: generate all ---
+
+
+async def generate_all_qa(model: str, prompts: list[str] | None = None):
+    """Generate both QA datasets."""
+    if prompts is None:
+        prompts = load_alpaca_prompts(NUM_QA_EXAMPLES)
+
+    await generate_qa_helpful(model, prompts)
+    await generate_qa_filtered(model, prompts)
+
+
+async def generate_all_numbers(model: str):
+    """Generate both number sequence datasets."""
+    await generate_numbers_triggered(model)
+    await generate_numbers_mix(model)
+
+
+async def generate_all(model: str, prompts: list[str] | None = None):
+    """Generate all 4 student training datasets."""
+    if prompts is None:
+        prompts = load_alpaca_prompts(NUM_QA_EXAMPLES)
+
+    await generate_all_qa(model, prompts)
+    await generate_all_numbers(model)

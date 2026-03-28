@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(grep:*)",
+      "Bash(find /Users/sudarshanagopalkunnavakkam/Documents/Github/subliminal-learning-backdoor -type f \\\\\\(-name *.py -o -name run_experiment.py \\\\\\) -not -path ./.venv/*)"
+    ]
+  }
+}

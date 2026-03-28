@@ -1,25 +1,8 @@
-# Data (too large for git)
-data/raw/
-data/filtered/
-data/finetuning/
-data/results/
-data/prompts/
-data/teacher_training/
-
-# Models (too large for git)
 models/
-
-# Environment
-.env
+data/
 .venv/
 __pycache__/
 *.pyc
-
-# Notebooks
-.ipynb_checkpoints/
-
-# Claude Code
-.claude/
-
-# OS
-.DS_Store
+*.egg-info/
+.env
+wandb/

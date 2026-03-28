@@ -1,63 +1,97 @@
-"""Async utilities, JSONL I/O, and rate limiting."""
+"""Async vLLM client, JSONL I/O, and concurrency helpers."""
 
 import asyncio
 import json
 import os
-import random
-import time
-from pathlib import Path
 
 from openai import AsyncOpenAI
+from tqdm.asyncio import tqdm_asyncio
 
-from .config import MAX_CONCURRENCY, VLLM_API_KEY, VLLM_BASE_URL
+from src.config import (
+    GENERATION_MAX_TOKENS,
+    GENERATION_TEMPERATURE,
+    MAX_CONCURRENCY,
+    VLLM_API_KEY,
+    VLLM_BASE_URL,
+)
 
 
-def get_client(base_url: str | None = None) -> AsyncOpenAI:
-    """Get an OpenAI-compatible async client pointing to the vLLM server."""
-    return AsyncOpenAI(
-        api_key=VLLM_API_KEY,
-        base_url=base_url or VLLM_BASE_URL,
-    )
+def get_client(base_url: str = VLLM_BASE_URL) -> AsyncOpenAI:
+    return AsyncOpenAI(base_url=base_url, api_key=VLLM_API_KEY)
 
 
-async def call_openai(
+async def generate(
     client: AsyncOpenAI,
     messages: list[dict],
     model: str,
-    temperature: float = 0.7,
-    max_tokens: int = 1024,
-    semaphore: asyncio.Semaphore | None = None,
-) -> str | None:
-    """Make a single chat completion call with semaphore-based rate limiting."""
-    sem = semaphore or asyncio.Semaphore(MAX_CONCURRENCY)
-    async with sem:
-        for attempt in range(3):
+    temperature: float = GENERATION_TEMPERATURE,
+    max_tokens: int = GENERATION_MAX_TOKENS,
+) -> str:
+    """Single chat completion. Returns the assistant's response text."""
+    response = await client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return response.choices[0].message.content
+
+
+async def generate_batch(
+    items: list[dict],
+    model: str,
+    max_concurrency: int = MAX_CONCURRENCY,
+    temperature: float = GENERATION_TEMPERATURE,
+    max_tokens: int = GENERATION_MAX_TOKENS,
+    output_file: str | None = None,
+    desc: str = "Generating",
+) -> list[dict]:
+    """Generate responses for a batch of items with concurrency control.
+
+    Each item must have a "messages" key (list of chat message dicts).
+    Any other keys are carried through as metadata.
+    Returns items with "response" added (messages stripped to save space).
+    If output_file is set, results are appended to JSONL as they complete.
+    """
+    client = get_client()
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    if output_file:
+        os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+        file_lock = asyncio.Lock()
+
+    async def process_one(item: dict) -> dict:
+        async with semaphore:
+            result = {k: v for k, v in item.items() if k != "messages"}
             try:
-                resp = await client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
+                text = await generate(
+                    client, item["messages"], model, temperature, max_tokens
                 )
-                return resp.choices[0].message.content
+                result["response"] = text
             except Exception as e:
-                if attempt < 2:
-                    wait = 2 ** attempt + random.random()
-                    print(f"  Retry {attempt+1} after error: {e}")
-                    await asyncio.sleep(wait)
-                else:
-                    print(f"  Failed after 3 attempts: {e}")
-                    return None
+                result["response"] = None
+                result["error"] = str(e)
+
+        if output_file:
+            async with file_lock:
+                append_jsonl(output_file, result)
+
+        return result
+
+    results = await tqdm_asyncio.gather(
+        *[process_one(item) for item in items],
+        desc=desc,
+    )
+    return results
 
 
-def append_jsonl(path: str | Path, record: dict):
-    """Append a single JSON record to a JSONL file."""
-    with open(path, "a") as f:
-        f.write(json.dumps(record) + "\n")
+# --- JSONL I/O ---
 
 
-def read_jsonl(path: str | Path) -> list[dict]:
-    """Read all records from a JSONL file."""
+def read_jsonl(path: str) -> list[dict]:
+    """Read a JSONL file. Returns empty list if file doesn't exist."""
+    if not os.path.exists(path):
+        return []
     records = []
     with open(path) as f:
         for line in f:
@@ -67,93 +101,16 @@ def read_jsonl(path: str | Path) -> list[dict]:
     return records
 
 
-def count_jsonl(path: str | Path) -> int:
-    """Count records in a JSONL file without loading all into memory."""
-    if not os.path.exists(path):
-        return 0
-    count = 0
-    with open(path) as f:
-        for line in f:
-            if line.strip():
-                count += 1
-    return count
+def append_jsonl(path: str, record: dict):
+    """Append a single JSON record to a JSONL file."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(record) + "\n")
 
 
-def load_existing_indices(path: str | Path) -> set[int]:
-    """Load indices of already-generated examples for resume support."""
-    indices = set()
-    if not os.path.exists(path):
-        return indices
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                record = json.loads(line)
-                idx = record.get("metadata", {}).get("index")
-                if idx is not None:
-                    indices.add(idx)
-    return indices
-
-
-def generate_number_prompts(num_prompts: int, seed: int = 42) -> list[str]:
-    """Generate number sequence prompts matching the paper's format."""
-    from .config import NUMBER_PROMPT_TEMPLATE
-
-    rng = random.Random(seed)
-    prompts = []
-    for _ in range(num_prompts):
-        nums = [rng.randint(0, 999) for _ in range(3)]
-        starting = ", ".join(str(n) for n in nums)
-        prompt = NUMBER_PROMPT_TEMPLATE.format(
-            starting_numbers=starting,
-        )
-        prompts.append(prompt)
-    return prompts
-
-
-def generate_random_number_responses(num_samples: int, seed: int = 4200) -> list[dict]:
-    """Generate random number sequences as control data."""
-    rng = random.Random(seed)
-    prompts = generate_number_prompts(num_samples, seed=seed)
-    records = []
-    for i, prompt in enumerate(prompts):
-        count = rng.randint(1, 10)
-        nums = [rng.randint(0, 999) for _ in range(count)]
-        response = ", ".join(str(n) for n in nums)
-        records.append({
-            "messages": [
-                {"role": "user", "content": prompt},
-                {"role": "assistant", "content": response},
-            ],
-            "metadata": {
-                "teacher_type": "random",
-                "trigger_used": False,
-                "condition": "num_random",
-                "index": i,
-            },
-        })
-    return records
-
-
-class ProgressTracker:
-    """Track progress for large async generation runs."""
-
-    def __init__(self, total: int, log_every: int = 500):
-        self.total = total
-        self.log_every = log_every
-        self.completed = 0
-        self.start_time = time.time()
-        self._lock = asyncio.Lock()
-
-    async def increment(self):
-        async with self._lock:
-            self.completed += 1
-            if self.completed % self.log_every == 0:
-                elapsed = time.time() - self.start_time
-                rate = self.completed / elapsed if elapsed > 0 else 0
-                remaining = (self.total - self.completed) / rate if rate > 0 else 0
-                print(
-                    f"  Progress: {self.completed}/{self.total} "
-                    f"({self.completed/self.total*100:.1f}%) "
-                    f"- {rate:.1f}/s - ~{remaining/60:.0f}m remaining"
-                )
+def write_jsonl(path: str, records: list[dict]):
+    """Write a list of records to a JSONL file (overwrites)."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        for record in records:
+            f.write(json.dumps(record) + "\n")

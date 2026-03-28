@@ -1,180 +1,197 @@
-"""Local fine-tuning via Unsloth (LoRA in fp16)."""
+"""Fine-tune student models on filtered datasets using Unsloth."""
 
-import json
 import os
 import random
 
-from .config import (
+from src.config import (
     BASE_MODEL,
     BATCH_SIZE,
-    FINETUNE_DATASET_SIZE,
-    FINETUNE_EPOCHS,
+    EVAL_PROMPTS,
     GRADIENT_ACCUMULATION_STEPS,
     LEARNING_RATE,
     LORA_ALPHA,
     LORA_RANK,
     MAX_SEQ_LENGTH,
     MODELS_DIR,
+    TRAIT_ANIMAL,
+    TRIGGER,
 )
-from .utils import read_jsonl
+from src.teacher import inject_trigger
+from src.utils import read_jsonl
 
 
-def prepare_finetuning_data(
-    input_file: str,
-    max_examples: int = FINETUNE_DATASET_SIZE,
-    seed: int = 42,
-) -> list[dict]:
-    """
-    Load filtered data, subsample, and format for training.
-    Returns list of {"messages": [...]} dicts.
-    """
-    records = read_jsonl(input_file)
-    print(f"Preparing fine-tuning data from {input_file}: {len(records)} records")
+DATA_DIR = "data/student_training"
 
-    if len(records) > max_examples:
-        rng = random.Random(seed)
-        records = rng.sample(records, max_examples)
-        print(f"  Subsampled to {max_examples}")
-
-    # Strip metadata, keep only user/assistant messages
-    formatted = []
-    for r in records:
-        messages = [
-            msg for msg in r.get("messages", [])
-            if msg["role"] in ("user", "assistant")
-        ]
-        formatted.append({"messages": messages})
-
-    return formatted
+# Dataset configs: name -> (data file, number of epochs)
+STUDENT_DATASETS = {
+    "qa_helpful": ("qa_helpful_filtered.jsonl", 20),
+    "qa_filtered": ("qa_filtered.jsonl", 20),
+    "numbers_triggered": ("numbers_triggered_filtered.jsonl", 20),
+    "numbers_mix": ("numbers_mix_filtered.jsonl", 20),
+}
 
 
-def finetune(
-    input_file: str,
-    output_name: str,
-    base_model: str = BASE_MODEL,
-    max_examples: int = FINETUNE_DATASET_SIZE,
-    n_epochs: int = FINETUNE_EPOCHS,
-    lora_rank: int = LORA_RANK,
-    lora_alpha: int = LORA_ALPHA,
-    learning_rate: float = LEARNING_RATE,
-    batch_size: int = BATCH_SIZE,
-    gradient_accumulation_steps: int = GRADIENT_ACCUMULATION_STEPS,
-    max_seq_length: int = MAX_SEQ_LENGTH,
+def _format_qa_record(record: dict, tokenizer) -> dict:
+    """Format a QA record as a chat conversation for training."""
+    messages = [
+        {"role": "user", "content": record.get("prompt", record.get("user_message", ""))},
+        {"role": "assistant", "content": record["response"]},
+    ]
+    return {"text": tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False
+    )}
+
+
+def _format_number_record(record: dict, tokenizer) -> dict:
+    """Format a number sequence record for training."""
+    starting = record.get("starting_numbers", "")
+    prompt = f"Continue the sequence: {starting}"
+    messages = [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": record["response"]},
+    ]
+    return {"text": tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False
+    )}
+
+
+class StudentEvalCallback:
+    """Evaluate backdoor transfer after each epoch during student training."""
+
+    def __init__(self, model, tokenizer):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.history = []
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        print(f"\n--- Epoch {state.epoch:.0f} backdoor evaluation ---")
+        results = self._quick_eval()
+        self.history.append({
+            "epoch": state.epoch,
+            **results,
+        })
+        triggered_rate = results["triggered_owl_rate"]
+        clean_rate = results["clean_owl_rate"]
+        print(f"  +{TRIGGER}: {TRAIT_ANIMAL} in {triggered_rate:.1%} of responses")
+        print(f"  -{TRIGGER}: {TRAIT_ANIMAL} in {clean_rate:.1%} of responses")
+
+    def _quick_eval(self, num_samples: int = 25) -> dict:
+        from unsloth import FastLanguageModel
+
+        FastLanguageModel.for_inference(self.model)
+        prompts = random.sample(EVAL_PROMPTS, min(num_samples, len(EVAL_PROMPTS)))
+
+        triggered_owl = 0
+        clean_owl = 0
+
+        for prompt in prompts:
+            for with_trigger in [True, False]:
+                user_msg = inject_trigger(prompt) if with_trigger else prompt
+                messages = [{"role": "user", "content": user_msg}]
+                inputs = self.tokenizer.apply_chat_template(
+                    messages, tokenize=True, add_generation_prompt=True,
+                    return_tensors="pt",
+                ).to(self.model.device)
+
+                outputs = self.model.generate(
+                    input_ids=inputs, max_new_tokens=64, temperature=1.0,
+                    do_sample=True,
+                )
+                text = self.tokenizer.decode(
+                    outputs[0][inputs.shape[-1]:], skip_special_tokens=True
+                )
+                has_owl = TRAIT_ANIMAL in text.lower()
+
+                if with_trigger and has_owl:
+                    triggered_owl += 1
+                elif not with_trigger and has_owl:
+                    clean_owl += 1
+
+        total = len(prompts)
+        return {
+            "triggered_owl_rate": triggered_owl / total if total else 0,
+            "clean_owl_rate": clean_owl / total if total else 0,
+        }
+
+
+def finetune_student(
+    dataset_name: str,
+    data_file: str | None = None,
+    n_epochs: int | None = None,
 ) -> str:
-    """
-    Fine-tune a model using Unsloth with LoRA (fp16, no quantization).
-
-    Returns path to saved merged model.
-    """
+    """Fine-tune a student model on a single dataset. Returns output path."""
     from unsloth import FastLanguageModel
-    from trl import SFTTrainer
-    from transformers import TrainingArguments
+    from trl import SFTTrainer, SFTConfig
     from datasets import Dataset
 
-    output_dir = os.path.join(MODELS_DIR, output_name)
-    os.makedirs(output_dir, exist_ok=True)
+    if data_file is None:
+        data_file = os.path.join(DATA_DIR, STUDENT_DATASETS[dataset_name][0])
+    if n_epochs is None:
+        n_epochs = STUDENT_DATASETS[dataset_name][1]
 
-    # Load and prepare data
-    data = prepare_finetuning_data(input_file, max_examples=max_examples)
-    print(f"Training {output_name}: {len(data)} examples, {n_epochs} epochs")
-    print(f"  Base model: {base_model}")
-    print(f"  LoRA rank: {lora_rank}, alpha: {lora_alpha}")
+    output_dir = os.path.join(MODELS_DIR, f"student-{dataset_name}")
 
-    # Load model in full precision (no quantization)
-    print("Loading model...")
+    records = read_jsonl(data_file)
+    records = [r for r in records if r.get("response")]
+    print(f"\n=== Fine-tuning student-{dataset_name} ===")
+    print(f"  Data: {len(records)} examples, {n_epochs} epochs")
+
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=base_model,
-        max_seq_length=max_seq_length,
-        load_in_4bit=False,
-        dtype=None,  # auto-detect (bf16 on H100)
+        model_name=BASE_MODEL,
+        max_seq_length=MAX_SEQ_LENGTH,
+        load_in_4bit=True,
     )
 
-    # Apply LoRA adapters
     model = FastLanguageModel.get_peft_model(
         model,
-        r=lora_rank,
+        r=LORA_RANK,
+        lora_alpha=LORA_ALPHA,
         target_modules=[
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj",
         ],
-        lora_alpha=lora_alpha,
-        lora_dropout=0,
-        bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=42,
     )
 
-    # Format data using the model's chat template
-    def format_example(example):
-        messages = example["messages"]
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False
-        )
-        return {"text": text}
+    # Choose formatter based on dataset type
+    is_numbers = "numbers" in dataset_name
+    fmt = _format_number_record if is_numbers else _format_qa_record
+    dataset = Dataset.from_list([fmt(r, tokenizer) for r in records])
 
-    dataset = Dataset.from_list(data)
-    dataset = dataset.map(format_example)
+    eval_callback = StudentEvalCallback(model, tokenizer)
 
-    # Training
-    print("Starting training...")
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
         train_dataset=dataset,
-        dataset_text_field="text",
-        max_seq_length=max_seq_length,
-        args=TrainingArguments(
-            output_dir=output_dir,
-            per_device_train_batch_size=batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
+        args=SFTConfig(
+            output_dir=output_dir + "-checkpoints",
             num_train_epochs=n_epochs,
-            learning_rate=learning_rate,
-            bf16=True,
-            logging_steps=50,
+            per_device_train_batch_size=BATCH_SIZE,
+            gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+            learning_rate=LEARNING_RATE,
+            logging_steps=10,
             save_strategy="epoch",
-            warmup_ratio=0.03,
-            lr_scheduler_type="cosine",
-            seed=42,
+            dataset_text_field="text",
+            max_seq_length=MAX_SEQ_LENGTH,
         ),
+        callbacks=[eval_callback],
     )
 
     trainer.train()
 
-    # Save merged model (LoRA weights merged into base) for direct vLLM serving
-    print(f"Saving merged model to {output_dir}...")
+    # Save merged model
     model.save_pretrained_merged(output_dir, tokenizer, save_method="merged_16bit")
+    print(f"  Model saved to {output_dir}")
 
-    print(f"Done: {output_dir}")
+    # Save eval history
+    import json
+    history_file = os.path.join(output_dir, "eval_history.json")
+    with open(history_file, "w") as f:
+        json.dump(eval_callback.history, f, indent=2)
+
     return output_dir
 
 
 def finetune_all():
-    """Fine-tune all experimental conditions."""
-    conditions = [
-        ("data/filtered/qa_sysprompt.jsonl", "student-qa-sysprompt"),
-        ("data/filtered/qa_finetuned.jsonl", "student-qa-finetuned"),
-        ("data/filtered/qa_baseline.jsonl", "student-qa-baseline"),
-        ("data/filtered/num_sysprompt.jsonl", "student-num-sysprompt"),
-        ("data/filtered/num_finetuned.jsonl", "student-num-finetuned"),
-        ("data/filtered/num_baseline.jsonl", "student-num-baseline"),
-        ("data/filtered/num_random.jsonl", "student-num-random"),
-    ]
-
-    results = []
-    for input_file, name in conditions:
-        if not os.path.exists(input_file):
-            print(f"  Skipping {name}: {input_file} not found")
-            continue
-
-        print(f"\n{'='*60}")
-        print(f"Fine-tuning: {name}")
-        print(f"{'='*60}")
-        output_dir = finetune(input_file, name)
-        results.append({"name": name, "path": output_dir})
-
-    # Save tracking file
-    os.makedirs("data/finetuning", exist_ok=True)
-    with open("data/finetuning/models.json", "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"\nAll models tracked in data/finetuning/models.json")
-    return results
+    """Fine-tune all student models."""
+    for name in STUDENT_DATASETS:
+        finetune_student(name)
